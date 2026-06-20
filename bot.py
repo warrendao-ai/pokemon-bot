@@ -27,8 +27,16 @@ import time
 import threading
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+SGT = timezone(timedelta(hours=8))  # Singapore Time (UTC+8)
+
+def now_sgt() -> datetime:
+    return datetime.now(SGT)
+
+def fmt_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts, SGT).strftime("%I:%M:%S %p")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -41,7 +49,7 @@ ADMIN_IDS      = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0")) or None
 DATA_FILE      = "auction_data.json"
 POLL_TIMEOUT   = 30
-TIMER_INTERVAL = 5
+TIMER_INTERVAL = 1
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -154,9 +162,11 @@ def bid_keyboard(increments: list) -> dict:
     return {"inline_keyboard": rows}
 
 # ── Formatting ────────────────────────────────────────────────────────────────
-def format_timer_msg(auction: dict) -> str:
-    time_left = max(0, int(auction["ends_at"] - time.time()))
-    mins, secs = divmod(time_left, 60)
+def format_timer_msg(auction: dict, time_left_override: float = None) -> str:
+    time_left = max(0, int(time_left_override if time_left_override is not None
+                           else auction["ends_at"] - time.time()))
+    h, rem     = divmod(time_left, 3600)
+    mins, secs = divmod(rem, 60)
 
     total    = auction["ends_at"] - auction["starts_at"]
     fraction = time_left / total if total > 0 else 0
@@ -169,7 +179,11 @@ def format_timer_msg(auction: dict) -> str:
     else:
         bid_line = f"💰 Starting at <b>{fmt(auction['start_price'])}</b>"
 
-    timer_line = f"⏱ <b>{mins}m {secs}s remaining</b>" if time_left > 0 else "⛔ <b>AUCTION ENDED</b>"
+    if time_left > 0:
+        countdown  = f"{h:02d}:{mins:02d}:{secs:02d}" if h > 0 else f"{mins:02d}:{secs:02d}"
+        timer_line = f"⏱ <b>{countdown} remaining</b>"
+    else:
+        timer_line = "⛔ <b>AUCTION ENDED</b>"
 
     incs = auction.get("increments", [5, 10])
     inc_display = "  ".join(f"+{fmt(i)}" for i in incs)
@@ -215,6 +229,7 @@ def format_winner_msg(auction: dict) -> str:
 # ── Live timer thread ─────────────────────────────────────────────────────────
 def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
     # chat_id here is the log chat (already resolved before calling)
+    last_displayed = -1
     next_tick = time.time() + TIMER_INTERVAL
     while True:
         # Sleep precisely until next tick, accounting for API call time
@@ -246,11 +261,17 @@ def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
                         send(dm, format_winner_msg(auction))    # DM
                 return
 
+        # Only call Telegram API when the displayed second actually changes
+        display_second = int(time_left)
+        if display_second == last_displayed:
+            continue
+        last_displayed = display_second
+
         incs = auction.get("increments", [5, 10])
         api("editMessageText",
             chat_id=chat_id,
             message_id=timer_msg_id,
-            text=format_timer_msg(auction),
+            text=format_timer_msg(auction, time_left_override=time_left),
             parse_mode="HTML",
             reply_markup=bid_keyboard(incs))
 
@@ -547,7 +568,7 @@ def cmd_bid(msg: dict, args: list):
         send(cid, f"❌ {uname}: invalid amount. Example: /bid 150")
         return
 
-    _place_bid(cid, uid, uname, amount)
+    _place_bid(cid, uid, uname, amount, msg_date=msg.get("date"))
 
 def _cleanup_auction_messages(auction: dict, chat_id: int, timer_msg_id: int = None):
     """Delete all messages associated with the auction."""
@@ -577,8 +598,9 @@ def _end_auction_now(auction: dict, d: dict, chat_id: int):
             send(dm, format_winner_msg(auction))           # DM
     threading.Thread(target=_announce, daemon=True).start()
 
-def _place_bid(cid: int, uid: int, uname: str, amount: float):
-    """Shared bid logic used by /bid and inline buttons."""
+def _place_bid(cid: int, uid: int, uname: str, amount: float, msg_date: float = None):
+    """Shared bid logic used by /bid and inline buttons.
+    msg_date: Telegram message unix timestamp (more accurate than time.time())"""
     with data_lock:
         d = load_data()
         aid = d.get("active_auction")
@@ -590,7 +612,7 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
             send(cid, "⛔ Auction is not active.")
             return False
 
-        now = time.time()
+        now = msg_date if msg_date else time.time()
 
         # Time already up — end and announce winner even if bid just snuck in
         if now > auction["ends_at"]:
@@ -629,7 +651,7 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
         })
         save_data(d)
 
-    ts = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+    ts = fmt_time(now)
     bid_text = (f"⚡ <b>New Bid!</b>\n\n"
                 f"🎴 {auction['card_name']}\n"
                 f"💰 {fmt(amount)} by <b>{uname}</b>\n"
@@ -751,7 +773,7 @@ def cmd_listbids(msg: dict):
         return
     lines = [f"<b>📋 Bids — {auction['card_name']}</b>\n"]
     for i, b in enumerate(reversed(auction["bids"]), 1):
-        ts = datetime.fromtimestamp(b["time"]).strftime("%H:%M:%S")
+        ts = datetime.fromtimestamp(b["time"], SGT).strftime("%I:%M:%S %p")
         lines.append(f"#{i}  {fmt(b['amount'])} — {b['username']}  [{ts}]")
     send(cid, "\n".join(lines))
 
@@ -831,7 +853,7 @@ def handle_callback(cb: dict):
             save_data(d)
 
         answer_callback(query_id, f"✅ Bid placed: {fmt(amount)}")
-        ts = datetime.fromtimestamp(time.time()).strftime("%I:%M:%S %p")
+        ts = fmt_time(time.time())
         qtext = (f"⚡ <b>New Bid!</b>\n\n"
                  f"🎴 {auction['card_name']}\n"
                  f"💰 {fmt(amount)} by <b>{uname}</b>\n"
@@ -916,7 +938,7 @@ def dispatch(update: dict):
                     user  = msg["from"]
                     uname = get_user_display(user)
                     delete_message(msg["chat"]["id"], msg["message_id"])
-                    _place_bid(msg["chat"]["id"], user["id"], uname, amount)
+                    _place_bid(msg["chat"]["id"], user["id"], uname, amount, msg_date=msg.get("date"))
                     return
             except ValueError:
                 pass
