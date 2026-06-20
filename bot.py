@@ -698,18 +698,19 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float, msg_date: float = 
                 f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                 f"📊 Bid #{len(auction['bids'])}\n"
                 f"🕐 {ts}")
-    # Send to the group (where auction is posted)
-    gcid2 = auction.get("chat_id") or group_chat(cid)
-    bid_result = send(gcid2, bid_text, reply_markup=bid_keyboard(incs))
-    # Track group message ID for deletion on auction end
+    # Always send to GROUP_CHAT_ID — never to admin DM
+    dest = GROUP_CHAT_ID or cid
+    log.info(f"Sending bid announcement to chat {dest}")
+    bid_result = send(dest, bid_text, reply_markup=bid_keyboard(incs))
+    log.info(f"Bid send result: {bid_result}")
+    # Track message ID for cleanup (reuse existing store reference)
     if bid_result and bid_result.get("ok"):
         with data_lock:
-            d2 = load_data()
-            aid2 = d2.get("active_auction")
-            if aid2 and str(aid2) in d2["auctions"]:
-                d2["auctions"][str(aid2)].setdefault("extra_msg_ids", []).append(
+            d = load_data()
+            if str(aid) in d["auctions"]:
+                d["auctions"][str(aid)].setdefault("extra_msg_ids", []).append(
                     bid_result["result"]["message_id"])
-                save_data(d2)
+                save_data(d)
     return True
 
 def cmd_setinc(msg: dict, args: list):
@@ -900,8 +901,8 @@ def handle_callback(cb: dict):
                  f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                  f"📊 Bid #{len(auction['bids'])}\n"
                  f"🕐 {ts}")
-        qgcid = auction.get("chat_id") or group_chat(cid)
-        qresult = send(qgcid, qtext, reply_markup=bid_keyboard(incs))
+        dest2 = GROUP_CHAT_ID or cid
+        qresult = send(dest2, qtext, reply_markup=bid_keyboard(incs))
         if qresult and qresult.get("ok"):
             with data_lock:
                 d3 = load_data()
