@@ -790,11 +790,11 @@ def cmd_endauction(msg: dict):
         auction["status"] = "ended"
         d["active_auction"] = None
         save_data(d)
-    _cleanup_auction_messages(auction, cid)
-    send(cid, format_winner_msg(auction))          # group
-    dm = GROUP_CHAT_ID
-    if dm and dm != cid:
-        send(dm, format_winner_msg(auction))       # DM
+    gcid = GROUP_CHAT_ID or cid
+    _cleanup_auction_messages(auction, gcid)
+    send(gcid, format_winner_msg(auction))
+    if cid != gcid:
+        send(cid, "✅ Auction ended.")
 
 def cmd_listbids(msg: dict):
     cid = msg["chat"]["id"]
