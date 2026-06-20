@@ -56,30 +56,36 @@ TIMER_INTERVAL = 1
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-_data_cache: dict = {}
+# Single in-memory store — this IS the data, disk is just a backup
+_store: dict = {"auctions": {}, "active_auction": None, "next_id": 1}
+_store_ready = False
 
 def load_data() -> dict:
-    global _data_cache
-    if _data_cache:
-        return _data_cache
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE) as f:
-                _data_cache = json.load(f)
-                return _data_cache
-        except Exception:
-            pass
-    _data_cache = {"auctions": {}, "active_auction": None, "next_id": 1}
-    return _data_cache
+    """Always returns the live in-memory store."""
+    global _store, _store_ready
+    if not _store_ready:
+        # Load from disk only once on first call
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE) as f:
+                    _store = json.load(f)
+            except Exception:
+                pass
+        _store_ready = True
+    return _store
 
 def save_data(data: dict):
-    global _data_cache
-    _data_cache = data
-    try:
-        with open(DATA_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save to disk: {e}")
+    """Update in-memory store and flush to disk asynchronously."""
+    global _store
+    _store = data
+    # Write to disk in background so callers are not blocked
+    def _flush():
+        try:
+            with open(DATA_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log.warning(f"Disk flush failed: {e}")
+    threading.Thread(target=_flush, daemon=True).start()
 
 data_lock = threading.Lock()
 
