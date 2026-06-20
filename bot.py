@@ -47,22 +47,39 @@ ADMIN_IDS      = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 # Set this to your GROUP chat ID so auctions posted via DM appear in the group.
 # Find it by running /testchat inside the group.
 GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0")) or None
-DATA_FILE      = "auction_data.json"
+# Use /tmp on Railway (ephemeral but survives restarts within same deployment)
+# Falls back to local directory for Windows/local runs
+DATA_FILE = os.path.join(os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ""), "auction_data.json")             if os.getenv("RAILWAY_VOLUME_MOUNT_PATH")             else os.path.join("/tmp" if os.path.exists("/tmp") else ".", "auction_data.json")
 POLL_TIMEOUT   = 30
 TIMER_INTERVAL = 1
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Persistence ───────────────────────────────────────────────────────────────
+_data_cache: dict = {}
+
 def load_data() -> dict:
+    global _data_cache
+    if _data_cache:
+        return _data_cache
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return {"auctions": {}, "active_auction": None, "next_id": 1}
+        try:
+            with open(DATA_FILE) as f:
+                _data_cache = json.load(f)
+                return _data_cache
+        except Exception:
+            pass
+    _data_cache = {"auctions": {}, "active_auction": None, "next_id": 1}
+    return _data_cache
 
 def save_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    global _data_cache
+    _data_cache = data
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save to disk: {e}")
 
 data_lock = threading.Lock()
 
