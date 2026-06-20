@@ -56,33 +56,36 @@ TIMER_INTERVAL = 1
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-# Single in-memory store — this IS the data, disk is just a backup
+# Single in-memory store — all threads share the SAME dict object.
+# Never replace _store with a new dict — always mutate it in place.
 _store: dict = {"auctions": {}, "active_auction": None, "next_id": 1}
-_store_ready = False
+
+def _init_store():
+    """Load from disk into _store once at startup."""
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE) as f:
+                data = json.load(f)
+            _store.clear()
+            _store.update(data)
+            log.info(f"Loaded data from disk: {len(_store.get('auctions', {}))} auctions")
+        except Exception as e:
+            log.warning(f"Could not load from disk: {e}")
 
 def load_data() -> dict:
-    """Always returns the live in-memory store."""
-    global _store, _store_ready
-    if not _store_ready:
-        # Load from disk only once on first call
-        if os.path.exists(DATA_FILE):
-            try:
-                with open(DATA_FILE) as f:
-                    _store = json.load(f)
-            except Exception:
-                pass
-        _store_ready = True
+    """Return the shared in-memory store. All threads see the same object."""
     return _store
 
 def save_data(data: dict):
-    """Update in-memory store and flush to disk asynchronously."""
-    global _store
-    _store = data
-    # Write to disk in background so callers are not blocked
+    """Mutate _store in place (so all thread references stay valid) and flush to disk."""
+    _store.clear()
+    _store.update(data)
+    # Flush to disk in background
+    snapshot = json.dumps(data, indent=2)
     def _flush():
         try:
             with open(DATA_FILE, "w") as f:
-                json.dump(data, f, indent=2)
+                f.write(snapshot)
         except Exception as e:
             log.warning(f"Disk flush failed: {e}")
     threading.Thread(target=_flush, daemon=True).start()
@@ -1014,6 +1017,7 @@ def run():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         log.error("❌ Set BOT_TOKEN before running!")
         return
+    _init_store()
 
     offset = 0
     log.info("✅ Polling for updates…")
