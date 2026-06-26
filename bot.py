@@ -27,8 +27,16 @@ import time
 import threading
 import requests
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+SGT = timezone(timedelta(hours=8))  # Singapore Time (UTC+8)
+
+def now_sgt() -> datetime:
+    return datetime.now(SGT)
+
+def fmt_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts, SGT).strftime("%I:%M:%S %p")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -41,43 +49,20 @@ ADMIN_IDS      = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0")) or None
 DATA_FILE      = "auction_data.json"
 POLL_TIMEOUT   = 30
-TIMER_INTERVAL = 5
-ANTISNIPE_SECS   = 30   # trigger if bid placed within this many seconds of end
-ANTISNIPE_EXTEND = 30   # seconds added to timer when triggered
+TIMER_INTERVAL = 1
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-# Single shared dict — all threads read/write the same object in memory.
-# Disk is a backup only (loaded once on startup).
-_store: dict = {"auctions": {}, "active_auction": None, "next_id": 1}
-
-def _init_store():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE) as f:
-                data = json.load(f)
-            _store.clear()
-            _store.update(data)
-        except Exception as e:
-            log.warning(f"Could not load from disk: {e}")
-
 def load_data() -> dict:
-    return _store
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE) as f:
+            return json.load(f)
+    return {"auctions": {}, "active_auction": None, "next_id": 1}
 
 def save_data(data: dict):
-    # Mutate in place so all thread references stay valid
-    _store.clear()
-    _store.update(data)
-    # Flush to disk in background
-    snapshot = json.dumps(data, indent=2)
-    def _flush():
-        try:
-            with open(DATA_FILE, "w") as f:
-                f.write(snapshot)
-        except Exception as e:
-            log.warning(f"Disk flush failed: {e}")
-    threading.Thread(target=_flush, daemon=True).start()
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 data_lock = threading.Lock()
 
@@ -172,12 +157,16 @@ def bid_keyboard(increments: list) -> dict:
     for i in range(0, len(inc_buttons), 2):
         rows.append(inc_buttons[i:i+2])
 
+
+
     return {"inline_keyboard": rows}
 
 # ── Formatting ────────────────────────────────────────────────────────────────
-def format_timer_msg(auction: dict) -> str:
-    time_left = max(0, int(auction["ends_at"] - time.time()))
-    mins, secs = divmod(time_left, 60)
+def format_timer_msg(auction: dict, time_left_override: float = None) -> str:
+    time_left = max(0, int(time_left_override if time_left_override is not None
+                           else auction["ends_at"] - time.time()))
+    h, rem     = divmod(time_left, 3600)
+    mins, secs = divmod(rem, 60)
 
     total    = auction["ends_at"] - auction["starts_at"]
     fraction = time_left / total if total > 0 else 0
@@ -190,7 +179,11 @@ def format_timer_msg(auction: dict) -> str:
     else:
         bid_line = f"💰 Starting at <b>{fmt(auction['start_price'])}</b>"
 
-    timer_line = f"⏱ <b>{mins}m {secs}s remaining</b>" if time_left > 0 else "⛔ <b>AUCTION ENDED</b>"
+    if time_left > 0:
+        countdown  = f"{h:02d}:{mins:02d}:{secs:02d}" if h > 0 else f"{mins:02d}:{secs:02d}"
+        timer_line = f"⏱ <b>{countdown} remaining</b>"
+    else:
+        timer_line = "⛔ <b>AUCTION ENDED</b>"
 
     incs = auction.get("increments", [5, 10])
     inc_display = "  ".join(f"+{fmt(i)}" for i in incs)
@@ -236,6 +229,7 @@ def format_winner_msg(auction: dict) -> str:
 # ── Live timer thread ─────────────────────────────────────────────────────────
 def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
     # chat_id here is the log chat (already resolved before calling)
+    last_displayed = -1
     next_tick = time.time() + TIMER_INTERVAL
     while True:
         # Sleep precisely until next tick, accounting for API call time
@@ -267,11 +261,17 @@ def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
                         send(dm, format_winner_msg(auction))    # DM
                 return
 
+        # Only call Telegram API when the displayed second actually changes
+        display_second = int(time_left)
+        if display_second == last_displayed:
+            continue
+        last_displayed = display_second
+
         incs = auction.get("increments", [5, 10])
         api("editMessageText",
             chat_id=chat_id,
             message_id=timer_msg_id,
-            text=format_timer_msg(auction),
+            text=format_timer_msg(auction, time_left_override=time_left),
             parse_mode="HTML",
             reply_markup=bid_keyboard(incs))
 
@@ -568,7 +568,7 @@ def cmd_bid(msg: dict, args: list):
         send(cid, f"❌ {uname}: invalid amount. Example: /bid 150")
         return
 
-    _place_bid(cid, uid, uname, amount)
+    _place_bid(cid, uid, uname, amount, msg_date=msg.get("date"))
 
 def _cleanup_auction_messages(auction: dict, chat_id: int, timer_msg_id: int = None):
     """Delete all messages associated with the auction."""
@@ -598,8 +598,9 @@ def _end_auction_now(auction: dict, d: dict, chat_id: int):
             send(dm, format_winner_msg(auction))           # DM
     threading.Thread(target=_announce, daemon=True).start()
 
-def _place_bid(cid: int, uid: int, uname: str, amount: float):
-    """Shared bid logic used by /bid and inline buttons."""
+def _place_bid(cid: int, uid: int, uname: str, amount: float, msg_date: float = None):
+    """Shared bid logic used by /bid and inline buttons.
+    msg_date: Telegram message unix timestamp (more accurate than time.time())"""
     with data_lock:
         d = load_data()
         aid = d.get("active_auction")
@@ -611,7 +612,7 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
             send(cid, "⛔ Auction is not active.")
             return False
 
-        now = time.time()
+        now = msg_date if msg_date else time.time()
 
         # Time already up — end and announce winner even if bid just snuck in
         if now > auction["ends_at"]:
@@ -648,24 +649,14 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
             "amount":   amount,
             "time":     now,
         })
-
-        # ── Anti-snipe ────────────────────────────────────────────────────────
-        antisnipe_triggered = False
-        time_left = auction["ends_at"] - now
-        if 0 < time_left <= ANTISNIPE_SECS:
-            auction["ends_at"] += ANTISNIPE_EXTEND
-            antisnipe_triggered = True
-            log.info(f"Anti-snipe! Timer extended by {ANTISNIPE_EXTEND}s")
-
         save_data(d)
 
-    ts = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
-    snipe_notice = f"\n⏰ <b>Anti-snipe! +{ANTISNIPE_EXTEND}s added!</b>" if antisnipe_triggered else ""
+    ts = fmt_time(now)
     bid_text = (f"⚡ <b>New Bid!</b>\n\n"
                 f"🎴 {auction['card_name']}\n"
                 f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                 f"📊 Bid #{len(auction['bids'])}\n"
-                f"🕐 {ts}{snipe_notice}")
+                f"🕐 {ts}")
     # Send to the group (where auction is posted)
     gcid2 = auction.get("chat_id") or group_chat(cid)
     bid_result = send(gcid2, bid_text, reply_markup=bid_keyboard(incs))
@@ -782,7 +773,7 @@ def cmd_listbids(msg: dict):
         return
     lines = [f"<b>📋 Bids — {auction['card_name']}</b>\n"]
     for i, b in enumerate(reversed(auction["bids"]), 1):
-        ts = datetime.fromtimestamp(b["time"]).strftime("%H:%M:%S")
+        ts = datetime.fromtimestamp(b["time"], SGT).strftime("%I:%M:%S %p")
         lines.append(f"#{i}  {fmt(b['amount'])} — {b['username']}  [{ts}]")
     send(cid, "\n".join(lines))
 
@@ -800,7 +791,7 @@ def handle_callback(cb: dict):
             d = load_data()
         aid = d.get("active_auction")
         if not aid:
-            answer_callback(query_id, "⛔ Auction has ended!", alert=True)
+            answer_callback(query_id, "No active auction!", alert=True)
             return
         auction = d["auctions"].get(str(aid))
         time_left = max(0, int(auction["ends_at"] - time.time()))
@@ -844,41 +835,30 @@ def handle_callback(cb: dict):
             d = load_data()
             aid = d.get("active_auction")
             if not aid:
-                answer_callback(query_id)   # silently dismiss stale button
+                answer_callback(query_id, "No active auction!", alert=True)
                 return
             auction = d["auctions"].get(str(aid))
             if not auction or auction["status"] != "active" or time.time() > auction["ends_at"]:
-                answer_callback(query_id)   # silently dismiss stale button
+                answer_callback(query_id, "Auction ended!", alert=True)
                 return
 
             base   = auction["bids"][-1]["amount"] if auction["bids"] else auction["start_price"]
             amount = round(base + increment, 2)
             incs   = auction.get("increments", [5, 10])
-            now    = time.time()
 
             auction["bids"].append({
                 "user_id": uid, "username": uname,
-                "amount": amount, "time": now,
+                "amount": amount, "time": time.time(),
             })
-
-            # ── Anti-snipe ────────────────────────────────────────────────────
-            antisnipe_triggered = False
-            time_left = auction["ends_at"] - now
-            if 0 < time_left <= ANTISNIPE_SECS:
-                auction["ends_at"] += ANTISNIPE_EXTEND
-                antisnipe_triggered = True
-                log.info(f"Anti-snipe on quickbid! Timer extended by {ANTISNIPE_EXTEND}s")
-
             save_data(d)
 
         answer_callback(query_id, f"✅ Bid placed: {fmt(amount)}")
-        ts = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
-        snipe_notice = f"\n⏰ <b>Anti-snipe! +{ANTISNIPE_EXTEND}s added!</b>" if antisnipe_triggered else ""
+        ts = fmt_time(time.time())
         qtext = (f"⚡ <b>New Bid!</b>\n\n"
                  f"🎴 {auction['card_name']}\n"
                  f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                  f"📊 Bid #{len(auction['bids'])}\n"
-                 f"🕐 {ts}{snipe_notice}")
+                 f"🕐 {ts}")
         qgcid = auction.get("chat_id") or group_chat(cid)
         qresult = send(qgcid, qtext, reply_markup=bid_keyboard(incs))
         if qresult and qresult.get("ok"):
@@ -958,7 +938,7 @@ def dispatch(update: dict):
                     user  = msg["from"]
                     uname = get_user_display(user)
                     delete_message(msg["chat"]["id"], msg["message_id"])
-                    _place_bid(msg["chat"]["id"], user["id"], uname, amount)
+                    _place_bid(msg["chat"]["id"], user["id"], uname, amount, msg_date=msg.get("date"))
                     return
             except ValueError:
                 pass
@@ -993,7 +973,6 @@ def run():
         log.error("❌ Set BOT_TOKEN before running!")
         return
 
-    _init_store()
     offset = 0
     log.info("✅ Polling for updates…")
 
