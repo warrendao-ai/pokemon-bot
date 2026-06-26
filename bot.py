@@ -228,16 +228,55 @@ def format_winner_msg(auction: dict) -> str:
 
 # ── Live timer thread ─────────────────────────────────────────────────────────
 def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
-    # chat_id here is the log chat (already resolved before calling)
+    """
+    Timer thread — designed to be as lightweight as possible.
+    - Sleeps in 0.25s increments for responsiveness
+    - Reads disk only to get fresh bid info (not for timing)
+    - Calculates time_left from ends_at every loop (no drift)
+    - Only edits Telegram message when displayed second changes
+    """
     last_displayed = -1
-    next_tick = time.time() + TIMER_INTERVAL
-    while True:
-        # Sleep precisely until next tick, accounting for API call time
-        sleep_for = next_tick - time.time()
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-        next_tick += TIMER_INTERVAL
+    # Cache ends_at so we don't need disk reads for timing
+    with data_lock:
+        d = load_data()
+        auction = d["auctions"].get(str(auction_id))
+        if not auction:
+            return
+        ends_at = auction["ends_at"]
 
+    while True:
+        time.sleep(0.25)  # check 4x per second for responsiveness
+
+        now       = time.time()
+        time_left = ends_at - now
+
+        # Time's up — do a full disk read to end properly
+        if time_left <= 0:
+            with data_lock:
+                d = load_data()
+                if d.get("active_auction") != auction_id:
+                    return
+                auction = d["auctions"].get(str(auction_id))
+                if not auction:
+                    return
+                if auction["status"] == "active":
+                    auction["status"] = "ended"
+                    d["active_auction"] = None
+                    save_data(d)
+                    _cleanup_auction_messages(auction, chat_id, timer_msg_id)
+                    send(chat_id, format_winner_msg(auction))
+                    dm = GROUP_CHAT_ID
+                    if dm and dm != chat_id:
+                        send(dm, format_winner_msg(auction))
+            return
+
+        # Only update display when the second changes
+        display_second = int(time_left)
+        if display_second == last_displayed:
+            continue
+        last_displayed = display_second
+
+        # Quick disk read to get latest bids for display
         with data_lock:
             d = load_data()
             if d.get("active_auction") != auction_id:
@@ -245,27 +284,6 @@ def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
             auction = d["auctions"].get(str(auction_id))
             if not auction:
                 return
-
-            time_left = auction["ends_at"] - time.time()
-
-            if time_left <= 0:
-                # Only end if not already ended by a last-second bid
-                if auction["status"] == "active":
-                    auction["status"] = "ended"
-                    d["active_auction"] = None
-                    save_data(d)
-                    _cleanup_auction_messages(auction, chat_id, timer_msg_id)
-                    send(chat_id, format_winner_msg(auction))   # group
-                    dm = GROUP_CHAT_ID
-                    if dm and dm != chat_id:
-                        send(dm, format_winner_msg(auction))    # DM
-                return
-
-        # Only call Telegram API when the displayed second actually changes
-        display_second = int(time_left)
-        if display_second == last_displayed:
-            continue
-        last_displayed = display_second
 
         incs = auction.get("increments", [5, 10])
         api("editMessageText",
