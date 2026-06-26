@@ -36,12 +36,12 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_IDS      = set(int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
-# Set this to your GROUP chat ID so auctions posted via DM appear in the group.
-# Find it by running /testchat inside the group.
 GROUP_CHAT_ID  = int(os.getenv("GROUP_CHAT_ID", "0")) or None
 DATA_FILE      = "auction_data.json"
 POLL_TIMEOUT   = 30
 TIMER_INTERVAL = 5
+ANTISNIPE_SECS   = 30   # trigger if bid placed within this many seconds of end
+ANTISNIPE_EXTEND = 30   # seconds added to timer when triggered
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -71,7 +71,6 @@ def api(method: str, **kwargs) -> Optional[dict]:
         return None
 
 def group_chat(sender_cid: int) -> int:
-    """Returns the configured group chat, or falls back to sender chat."""
     return GROUP_CHAT_ID if GROUP_CHAT_ID else sender_cid
 
 def send(chat_id, text, parse_mode="HTML", reply_markup=None) -> Optional[dict]:
@@ -99,7 +98,6 @@ def send_video(chat_id, video_id, caption, parse_mode="HTML", reply_markup=None)
     return api("sendVideo", **kwargs)
 
 def send_media_group(chat_id, media: list):
-    """Send up to 10 photos/videos as an album. media = list of {type, file_id, caption?}"""
     tg_media = []
     for i, m in enumerate(media[:10]):
         item = {"type": m["type"], "media": m["file_id"]}
@@ -113,7 +111,6 @@ def delete_message(chat_id, message_id):
     api("deleteMessage", chat_id=chat_id, message_id=message_id)
 
 def remove_keyboard(chat_id, message_id):
-    """Strip inline keyboard from a message."""
     api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
         reply_markup={"inline_keyboard": []})
 
@@ -127,30 +124,19 @@ def get_user_display(user: dict) -> str:
     return name
 
 def fmt(amount: float) -> str:
-    """Format dollar amount nicely."""
     if amount == int(amount):
         return f"${int(amount):,}"
     return f"${amount:,.2f}"
 
-# ── Keyboard builder (uses auction's custom increments) ───────────────────────
+# ── Keyboard builder ──────────────────────────────────────────────────────────
 def bid_keyboard(increments: list) -> dict:
-    """
-    Build inline keyboard from the auction's increment list.
-    Up to 4 increments shown as quick-bid buttons.
-    Always adds a ✏️ Custom Bid button and 📊 Status button.
-    """
     inc_buttons = [
         {"text": f"+{fmt(i)}", "callback_data": f"quickbid:{i}"}
         for i in increments[:2]
     ]
-
-    # Split increment buttons into rows of 2
     rows = []
     for i in range(0, len(inc_buttons), 2):
         rows.append(inc_buttons[i:i+2])
-
-
-
     return {"inline_keyboard": rows}
 
 # ── Formatting ────────────────────────────────────────────────────────────────
@@ -214,10 +200,8 @@ def format_winner_msg(auction: dict) -> str:
 
 # ── Live timer thread ─────────────────────────────────────────────────────────
 def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
-    # chat_id here is the log chat (already resolved before calling)
     next_tick = time.time() + TIMER_INTERVAL
     while True:
-        # Sleep precisely until next tick, accounting for API call time
         sleep_for = next_tick - time.time()
         if sleep_for > 0:
             time.sleep(sleep_for)
@@ -234,16 +218,12 @@ def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
             time_left = auction["ends_at"] - time.time()
 
             if time_left <= 0:
-                # Only end if not already ended by a last-second bid
                 if auction["status"] == "active":
                     auction["status"] = "ended"
                     d["active_auction"] = None
                     save_data(d)
                     _cleanup_auction_messages(auction, chat_id, timer_msg_id)
-                    send(chat_id, format_winner_msg(auction))   # group
-                    dm = GROUP_CHAT_ID
-                    if dm and dm != chat_id:
-                        send(dm, format_winner_msg(auction))    # DM
+                    send(chat_id, format_winner_msg(auction))
                 return
 
         incs = auction.get("increments", [5, 10])
@@ -254,7 +234,7 @@ def run_live_timer(chat_id: int, auction_id: int, timer_msg_id: int):
             parse_mode="HTML",
             reply_markup=bid_keyboard(incs))
 
-# ── Parse increments from string "5,10,25,50" ────────────────────────────────
+# ── Parse increments ──────────────────────────────────────────────────────────
 def parse_increments(raw: str) -> list:
     result = []
     for part in raw.split(","):
@@ -267,15 +247,8 @@ def parse_increments(raw: str) -> list:
             pass
     return result[:2] if result else [5, 10]
 
-# ── Duration parser ──────────────────────────────────────────────────────────
+# ── Duration parser ───────────────────────────────────────────────────────────
 def parse_duration(raw: str) -> float:
-    """
-    Accepts:
-      "1:30:00"  → 1h 30m 0s  = 5400s
-      "5:30"     → 5m 30s     = 330s
-      "10"       → 10 minutes = 600s
-    Returns total seconds as float.
-    """
     raw = raw.strip()
     parts = raw.split(":")
     try:
@@ -302,10 +275,8 @@ def fmt_duration(seconds: float) -> str:
     else:
         return f"{s}s"
 
-# ── Pending media groups (album) collector ────────────────────────────────────
-# Telegram sends each photo in an album as a separate message with the same
-# media_group_id. We buffer them for 2 seconds then process together.
-_pending_albums: dict = {}   # media_group_id -> {"msgs": [...], "timer": Timer}
+# ── Album collector ───────────────────────────────────────────────────────────
+_pending_albums: dict = {}
 _album_lock = threading.Lock()
 
 def _flush_album(media_group_id: str):
@@ -315,10 +286,6 @@ def _flush_album(media_group_id: str):
         _start_auction_from_media(bundle["msgs"])
 
 def handle_media_msg(msg: dict):
-    """
-    Handles single photo, single video, or album (media group).
-    Admin must put the /newauction command in the caption of the FIRST item.
-    """
     cid = msg["chat"]["id"]
     uid = msg["from"]["id"]
     if uid not in ADMIN_IDS:
@@ -328,12 +295,10 @@ def handle_media_msg(msg: dict):
     mgid    = msg.get("media_group_id")
 
     if mgid:
-        # Part of an album — buffer and wait for all parts
         with _album_lock:
             if mgid not in _pending_albums:
                 _pending_albums[mgid] = {"msgs": [], "timer": None}
             _pending_albums[mgid]["msgs"].append(msg)
-            # Reset the flush timer
             if _pending_albums[mgid]["timer"]:
                 _pending_albums[mgid]["timer"].cancel()
             t = threading.Timer(2.0, _flush_album, args=(mgid,))
@@ -341,16 +306,10 @@ def handle_media_msg(msg: dict):
             t.start()
         return
 
-    # Single photo or video — process immediately
     if caption.lower().startswith("/newauction"):
         _start_auction_from_media([msg])
 
 def _start_auction_from_media(msgs: list):
-    """
-    msgs: list of Telegram message dicts (one per photo/video in album).
-    The message with /newauction in its caption is the main one.
-    """
-    # Find the message carrying the /newauction caption
     main_msg = None
     for m in msgs:
         cap = (m.get("caption") or "").strip()
@@ -358,9 +317,9 @@ def _start_auction_from_media(msgs: list):
             main_msg = m
             break
     if not main_msg:
-        return  # no command caption found — ignore
+        return
 
-    cid = main_msg["chat"]["id"]
+    cid     = main_msg["chat"]["id"]
     caption = (main_msg.get("caption") or "").strip()
     body    = caption[len("/newauction"):].strip()
     parts   = [p.strip() for p in body.split("|")]
@@ -368,12 +327,12 @@ def _start_auction_from_media(msgs: list):
     if len(parts) < 3:
         send(cid,
              "❌ Wrong format. Send media with caption:\n\n"
-             "<code>/newauction Card Name | price | minutes | increments</code>\n\n"
+             "<code>/newauction Card Name | price | duration | increments</code>\n\n"
              "Examples:\n"
              "<code>/newauction Charizard Holo | 100 | 5 | 5,10</code>\n"
              "<code>/newauction Mewtwo 1st Ed | 500 | 10 | 20,50</code>\n\n"
-             "Works with a single photo, video, or an album of up to 10 photos/videos.\n"
-             "Increments are optional — defaults to 5,10")
+             "Duration: <code>5</code>=5min  <code>1:30</code>=1m30s  <code>1:00:00</code>=1hr\n"
+             "Increments optional — defaults to 5,10")
         return
 
     card_name = parts[0]
@@ -391,7 +350,6 @@ def _start_auction_from_media(msgs: list):
 
     increments = parse_increments(parts[3]) if len(parts) >= 4 else [5, 10]
 
-    # Collect all media from the messages
     media_items = []
     for m in msgs:
         if "photo" in m:
@@ -403,6 +361,8 @@ def _start_auction_from_media(msgs: list):
         send(cid, "❌ No photo or video detected.")
         return
 
+    gcid = group_chat(cid)
+
     with data_lock:
         d = load_data()
         if d.get("active_auction"):
@@ -412,37 +372,35 @@ def _start_auction_from_media(msgs: list):
         aid = d["next_id"]
         d["next_id"] += 1
         auction = {
-            "id":          aid,
-            "card_name":   card_name,
-            "media":       media_items,          # list of {type, file_id}
-            "start_price": start_price,
-            "increments":  increments if increments else [5, 10],
-            "bids":        [],
-            "status":      "active",
-            "starts_at":   time.time(),
-            "ends_at":     time.time() + duration,
-            "chat_id":     cid,
-            "extra_msg_ids": [],   # bid announcements + other messages to delete on end
+            "id":            aid,
+            "card_name":     card_name,
+            "media":         media_items,
+            "start_price":   start_price,
+            "increments":    increments if increments else [5, 10],
+            "bids":          [],
+            "status":        "active",
+            "starts_at":     time.time(),
+            "ends_at":       time.time() + duration,
+            "chat_id":       gcid,
+            "extra_msg_ids": [],
         }
         d["auctions"][str(aid)] = auction
         d["active_auction"] = aid
         save_data(d)
 
-    gcid = group_chat(cid)   # post auction to group, not admin DM
-    # Confirm to admin in DM
     if gcid != cid:
         send(cid, f"✅ Auction starting in group!")
 
     media_result = _post_auction_media(gcid, auction)
-    # Save the message_id so we can clean it up when auction ends
     if media_result and media_result.get("ok"):
         with data_lock:
             d2 = load_data()
             if str(aid) in d2["auctions"]:
                 d2["auctions"][str(aid)]["media_msg_id"] = media_result["result"]["message_id"]
                 d2["auctions"][str(aid)]["media_msg_deletable"] = media_result.get("_deletable", False)
-                d2["auctions"][str(aid)]["chat_id"] = gcid   # store group chat id
+                d2["auctions"][str(aid)]["chat_id"] = gcid
                 save_data(d2)
+
     incs_for_kbd = auction.get("increments", [5, 10])
     timer_result = send(gcid, format_timer_msg(auction), reply_markup=bid_keyboard(incs_for_kbd))
     if timer_result and timer_result.get("ok"):
@@ -452,32 +410,20 @@ def _start_auction_from_media(msgs: list):
     log.info(f"Auction #{aid} started: {card_name} @ ${start_price}, {len(media_items)} media item(s)")
 
 def _post_auction_media(cid: int, auction: dict):
-    """
-    Post auction media then bid buttons.
-
-    Single photo/video  → sendPhoto/sendVideo with caption + buttons attached.
-    Multiple items      → sendMediaGroup (caption on first item, no buttons possible
-                          on albums) followed by a separate text message with buttons.
-
-    Returns the result of the message that carries the inline keyboard,
-    so the caller can store its message_id for later keyboard removal.
-    """
-    media  = auction.get("media", [])
-    incs   = auction.get("increments", [5, 10])
-    cap    = format_photo_caption(auction)
+    media = auction.get("media", [])
+    incs  = auction.get("increments", [5, 10])
+    cap   = format_photo_caption(auction)
 
     if not media:
         return None
 
     if len(media) == 1:
-        # Single item — caption + buttons on the same message
         first = media[0]
         if first["type"] == "video":
             return send_video(cid, first["file_id"], cap, reply_markup=bid_keyboard(incs))
         else:
             return send_photo(cid, first["file_id"], cap, reply_markup=bid_keyboard(incs))
     else:
-        # Multiple items — send all as one album with caption on first item
         tg_media = []
         for i, m in enumerate(media[:10]):
             item = {"type": m["type"], "media": m["file_id"]}
@@ -486,8 +432,6 @@ def _post_auction_media(cid: int, auction: dict):
                 item["parse_mode"] = "HTML"
             tg_media.append(item)
         api("sendMediaGroup", chat_id=cid, media=tg_media)
-
-        # Return None — buttons will be on the timer message instead
         return None
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -501,11 +445,11 @@ def cmd_start(msg: dict):
          f"  /auction — See active auction\n"
          f"  /bid &lt;amount&gt; — Place any bid\n"
          f"  /myauctions — Your history\n\n"
-         f"<b>Admin — start auction:</b>\n"
+         f"<b>Admin — start auction via DM:</b>\n"
          f"  Send a photo with caption:\n"
-         f"  <code>/newauction Name | price | mins | increments</code>\n\n"
+         f"  <code>/newauction Name | price | duration | inc1,inc2</code>\n\n"
          f"<b>Admin — change increments mid-auction:</b>\n"
-         f"  <code>/setinc 10,25,50,100</code>\n\n"
+         f"  <code>/setinc 10,25</code>\n\n"
          f"<i>Good luck! 🌟</i>")
 
 def cmd_auction(msg: dict):
@@ -523,8 +467,7 @@ def cmd_auction(msg: dict):
     incs = auction.get("increments", [5, 10])
     if auction.get("media"):
         _post_auction_media(cid, auction)
-    incs2 = auction.get("increments", [5, 10])
-    send(cid, format_timer_msg(auction), reply_markup=bid_keyboard(incs2))
+    send(cid, format_timer_msg(auction), reply_markup=bid_keyboard(incs))
 
 def cmd_bid(msg: dict, args: list):
     cid   = msg["chat"]["id"]
@@ -533,7 +476,6 @@ def cmd_bid(msg: dict, args: list):
     uname = get_user_display(user)
     mid   = msg["message_id"]
 
-    # Delete the user's /bid command so only the bot response shows
     delete_message(cid, mid)
 
     if not args:
@@ -550,7 +492,6 @@ def cmd_bid(msg: dict, args: list):
     _place_bid(cid, uid, uname, amount)
 
 def _cleanup_auction_messages(auction: dict, chat_id: int, timer_msg_id: int = None):
-    """Delete all messages associated with the auction."""
     media_msg_id = auction.get("media_msg_id")
     deletable    = auction.get("media_msg_deletable", False)
     if media_msg_id:
@@ -560,27 +501,22 @@ def _cleanup_auction_messages(auction: dict, chat_id: int, timer_msg_id: int = N
             remove_keyboard(chat_id, media_msg_id)
     if timer_msg_id:
         delete_message(chat_id, timer_msg_id)
-    # Delete all bid announcement messages
     for mid in auction.get("extra_msg_ids", []):
         delete_message(chat_id, mid)
 
 def _end_auction_now(auction: dict, d: dict, chat_id: int):
-    """Mark auction ended, clean up messages, and announce winner. Call inside data_lock."""
     auction["status"] = "ended"
     d["active_auction"] = None
     save_data(d)
     def _announce():
-        _cleanup_auction_messages(auction, chat_id)
-        send(chat_id, format_winner_msg(auction))          # group
-        dm = GROUP_CHAT_ID
-        if dm and dm != chat_id:
-            send(dm, format_winner_msg(auction))           # DM
+        gcid = GROUP_CHAT_ID or chat_id
+        _cleanup_auction_messages(auction, gcid)
+        send(gcid, format_winner_msg(auction))
     threading.Thread(target=_announce, daemon=True).start()
 
 def _place_bid(cid: int, uid: int, uname: str, amount: float):
-    """Shared bid logic used by /bid and inline buttons."""
     with data_lock:
-        d = load_data()
+        d   = load_data()
         aid = d.get("active_auction")
         if not aid:
             send(cid, "😴 No active auction!")
@@ -592,33 +528,16 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
 
         now = time.time()
 
-        # Time already up — end and announce winner even if bid just snuck in
-        if now > auction["ends_at"]:
-            # Accept the bid if it arrived within a 2-second grace window
-            grace = 2
-            if now <= auction["ends_at"] + grace:
-                auction["bids"].append({
-                    "user_id":  uid,
-                    "username": uname,
-                    "amount":   amount,
-                    "time":     now,
-                })
-            _end_auction_now(auction, d, cid)
-            send(cid, "⏰ Time's up! Your bid was the last one." if now <= auction["ends_at"] + 2
-                      else "⏰ Auction has already ended!")
+        if now > auction["ends_at"] + 2:
+            send(cid, "⏰ Auction has already ended!")
             return False
 
-        # Minimum bid = current top bid + smallest increment (or start price)
-        incs = auction.get("increments", [5, 10])
-        min_increment = min(incs)
-        if auction["bids"]:
-            min_bid = auction["bids"][-1]["amount"] + min_increment
-        else:
-            min_bid = auction["start_price"]
+        incs        = auction.get("increments", [5, 10])
+        min_inc     = min(incs)
+        min_bid     = (auction["bids"][-1]["amount"] + min_inc) if auction["bids"] else auction["start_price"]
 
         if amount < min_bid:
-            send(cid, f"❌ Minimum bid is <b>{fmt(min_bid)}</b>\n"
-                      f"<i>(current top + smallest increment of {fmt(min_increment)})</i>")
+            send(cid, f"❌ Minimum bid is <b>{fmt(min_bid)}</b>")
             return False
 
         auction["bids"].append({
@@ -627,18 +546,26 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
             "amount":   amount,
             "time":     now,
         })
+
+        # ── Anti-snipe ────────────────────────────────────────────────────────
+        antisnipe_triggered = False
+        time_left = auction["ends_at"] - now
+        if 0 < time_left <= ANTISNIPE_SECS:
+            auction["ends_at"] += ANTISNIPE_EXTEND
+            antisnipe_triggered = True
+            log.info(f"Anti-snipe! Timer extended by {ANTISNIPE_EXTEND}s")
+
         save_data(d)
 
-    ts = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+    gcid = GROUP_CHAT_ID or auction.get("chat_id") or cid
+    ts   = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+    snipe_notice = f"\n⏰ <b>Anti-snipe! +{ANTISNIPE_EXTEND}s added!</b>" if antisnipe_triggered else ""
     bid_text = (f"⚡ <b>New Bid!</b>\n\n"
                 f"🎴 {auction['card_name']}\n"
                 f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                 f"📊 Bid #{len(auction['bids'])}\n"
-                f"🕐 {ts}")
-    # Send to the group (where auction is posted)
-    gcid2 = auction.get("chat_id") or group_chat(cid)
-    bid_result = send(gcid2, bid_text, reply_markup=bid_keyboard(incs))
-    # Track group message ID for deletion on auction end
+                f"🕐 {ts}{snipe_notice}")
+    bid_result = send(gcid, bid_text, reply_markup=bid_keyboard(incs))
     if bid_result and bid_result.get("ok"):
         with data_lock:
             d2 = load_data()
@@ -650,23 +577,20 @@ def _place_bid(cid: int, uid: int, uname: str, amount: float):
     return True
 
 def cmd_setinc(msg: dict, args: list):
-    """Admin: change bid increments mid-auction. /setinc 10,25,50,100"""
     cid = msg["chat"]["id"]
     uid = msg["from"]["id"]
     if uid not in ADMIN_IDS:
         send(cid, "⛔ Admin only.")
         return
     if not args:
-        send(cid, "Usage: <code>/setinc 10,25,50,100</code>")
+        send(cid, "Usage: <code>/setinc 10,25</code>")
         return
-
     increments = parse_increments(args[0])
     if not increments:
-        send(cid, "❌ Invalid increments. Example: <code>/setinc 10,25,50,100</code>")
+        send(cid, "❌ Invalid increments. Example: <code>/setinc 10,25</code>")
         return
-
     with data_lock:
-        d = load_data()
+        d   = load_data()
         aid = d.get("active_auction")
         if not aid:
             send(cid, "No active auction.")
@@ -674,12 +598,9 @@ def cmd_setinc(msg: dict, args: list):
         auction = d["auctions"].get(str(aid))
         auction["increments"] = increments
         save_data(d)
-
     inc_display = "  ".join(fmt(i) for i in increments)
     send(cid,
-         f"✅ <b>Bid increments updated!</b>\n\n"
-         f"New buttons: {inc_display}\n\n"
-         f"<i>Takes effect on the next bid.</i>",
+         f"✅ <b>Bid increments updated!</b>\n\nNew buttons: {inc_display}",
          reply_markup=bid_keyboard(increments))
 
 def cmd_myauctions(msg: dict):
@@ -718,20 +639,20 @@ def cmd_endauction(msg: dict):
         send(cid, "⛔ Admin only.")
         return
     with data_lock:
-        d = load_data()
+        d   = load_data()
         aid = d.get("active_auction")
         if not aid:
             send(cid, "No active auction.")
             return
         auction = d["auctions"].get(str(aid))
+        gcid    = GROUP_CHAT_ID or auction.get("chat_id") or cid
         auction["status"] = "ended"
         d["active_auction"] = None
         save_data(d)
-    _cleanup_auction_messages(auction, cid)
-    send(cid, format_winner_msg(auction))          # group
-    dm = GROUP_CHAT_ID
-    if dm and dm != cid:
-        send(dm, format_winner_msg(auction))       # DM
+    _cleanup_auction_messages(auction, gcid)
+    send(gcid, format_winner_msg(auction))
+    if cid != gcid:
+        send(cid, "✅ Auction ended.")
 
 def cmd_listbids(msg: dict):
     cid = msg["chat"]["id"]
@@ -751,11 +672,40 @@ def cmd_listbids(msg: dict):
         return
     lines = [f"<b>📋 Bids — {auction['card_name']}</b>\n"]
     for i, b in enumerate(reversed(auction["bids"]), 1):
-        ts = datetime.fromtimestamp(b["time"]).strftime("%H:%M:%S")
+        ts = datetime.fromtimestamp(b["time"]).strftime("%I:%M:%S %p")
         lines.append(f"#{i}  {fmt(b['amount'])} — {b['username']}  [{ts}]")
     send(cid, "\n".join(lines))
 
-# ── Callback buttons ──────────────────────────────────────────────────────────
+def cmd_mychatid(msg: dict):
+    cid = msg["chat"]["id"]
+    uid = msg["from"]["id"]
+    send(cid,
+         f"🆔 This chat ID: <code>{cid}</code>\n"
+         f"Your user ID: <code>{uid}</code>\n\n"
+         f"Run /testchat in your GROUP to get the group chat ID.")
+
+def cmd_testchat(msg: dict):
+    cid = msg["chat"]["id"]
+    uid = msg["from"]["id"]
+    if uid not in ADMIN_IDS:
+        send(cid, "⛔ Admin only.")
+        return
+    lines = [
+        f"<b>🔍 Chat Diagnostic</b>",
+        f"This chat ID: <code>{cid}</code>",
+        f"Your user ID: <code>{uid}</code>",
+        f"GROUP_CHAT_ID: <code>{GROUP_CHAT_ID or 'NOT SET'}</code>",
+        f"ADMIN_IDS: <code>{list(ADMIN_IDS)}</code>",
+    ]
+    send(cid, "\n".join(lines))
+    if GROUP_CHAT_ID and GROUP_CHAT_ID != cid:
+        r2 = send(GROUP_CHAT_ID, "✅ Test message — GROUP_CHAT_ID works!")
+        if r2 and r2.get("ok"):
+            send(cid, "✅ GROUP_CHAT_ID works!")
+        else:
+            send(cid, f"❌ GROUP_CHAT_ID failed: {r2}")
+
+# ── Callback handler ──────────────────────────────────────────────────────────
 def handle_callback(cb: dict):
     query_id = cb["id"]
     user     = cb["from"]
@@ -764,23 +714,7 @@ def handle_callback(cb: dict):
     cid      = cb["message"]["chat"]["id"]
     data     = cb.get("data", "")
 
-    if data == "status":
-        with data_lock:
-            d = load_data()
-        aid = d.get("active_auction")
-        if not aid:
-            answer_callback(query_id, "No active auction!", alert=True)
-            return
-        auction = d["auctions"].get(str(aid))
-        time_left = max(0, int(auction["ends_at"] - time.time()))
-        mins, secs = divmod(time_left, 60)
-        top = fmt(auction["bids"][-1]["amount"]) if auction["bids"] else "none yet"
-        answer_callback(query_id,
-                        f"⏱ {mins}m {secs}s left\n💰 Top: {top}\n📊 {len(auction['bids'])} bids",
-                        alert=True)
-
-    elif data == "custombid":
-        # Check auction is still active first
+    if data == "custombid":
         with data_lock:
             d = load_data()
         aid = d.get("active_auction")
@@ -791,26 +725,19 @@ def handle_callback(cb: dict):
         if not auction or auction["status"] != "active" or time.time() > auction["ends_at"]:
             answer_callback(query_id, "⛔ Auction has ended!", alert=True)
             return
-
         answer_callback(query_id)
-        top_str = ""
-        if auction["bids"]:
-            top_str = f"\nCurrent top: <b>{fmt(auction['bids'][-1]['amount'])}</b>"
-
-        # Send a force_reply message then immediately delete it —
-        # this opens the user's text field pre-filled with "/bid " without
-        # leaving any visible message in the chat.
         result = api("sendMessage",
             chat_id=cid,
             text=".",
-            reply_markup={"force_reply": True, "selective": True, "input_field_placeholder": "/bid "})
+            reply_markup={"force_reply": True, "selective": True,
+                          "input_field_placeholder": "/bid "})
         if result and result.get("ok"):
             delete_message(cid, result["result"]["message_id"])
 
     elif data.startswith("quickbid:"):
         increment = float(data.split(":")[1])
         with data_lock:
-            d = load_data()
+            d   = load_data()
             aid = d.get("active_auction")
             if not aid:
                 answer_callback(query_id, "No active auction!", alert=True)
@@ -823,22 +750,33 @@ def handle_callback(cb: dict):
             base   = auction["bids"][-1]["amount"] if auction["bids"] else auction["start_price"]
             amount = round(base + increment, 2)
             incs   = auction.get("increments", [5, 10])
+            now    = time.time()
 
             auction["bids"].append({
                 "user_id": uid, "username": uname,
-                "amount": amount, "time": time.time(),
+                "amount": amount, "time": now,
             })
+
+            # ── Anti-snipe ────────────────────────────────────────────────────
+            antisnipe_triggered = False
+            time_left = auction["ends_at"] - now
+            if 0 < time_left <= ANTISNIPE_SECS:
+                auction["ends_at"] += ANTISNIPE_EXTEND
+                antisnipe_triggered = True
+                log.info(f"Anti-snipe on quickbid! Timer extended by {ANTISNIPE_EXTEND}s")
+
             save_data(d)
 
         answer_callback(query_id, f"✅ Bid placed: {fmt(amount)}")
-        ts = datetime.fromtimestamp(time.time()).strftime("%I:%M:%S %p")
+        gcid = GROUP_CHAT_ID or auction.get("chat_id") or cid
+        ts   = datetime.fromtimestamp(now).strftime("%I:%M:%S %p")
+        snipe_notice = f"\n⏰ <b>Anti-snipe! +{ANTISNIPE_EXTEND}s added!</b>" if antisnipe_triggered else ""
         qtext = (f"⚡ <b>New Bid!</b>\n\n"
                  f"🎴 {auction['card_name']}\n"
                  f"💰 {fmt(amount)} by <b>{uname}</b>\n"
                  f"📊 Bid #{len(auction['bids'])}\n"
-                 f"🕐 {ts}")
-        qgcid = auction.get("chat_id") or group_chat(cid)
-        qresult = send(qgcid, qtext, reply_markup=bid_keyboard(incs))
+                 f"🕐 {ts}{snipe_notice}")
+        qresult = send(gcid, qtext, reply_markup=bid_keyboard(incs))
         if qresult and qresult.get("ok"):
             with data_lock:
                 d3 = load_data()
@@ -846,43 +784,6 @@ def handle_callback(cb: dict):
                     d3["auctions"][str(aid)].setdefault("extra_msg_ids", []).append(
                         qresult["result"]["message_id"])
                     save_data(d3)
-
-def cmd_mychatid(msg: dict):
-    cid = msg["chat"]["id"]
-    uid = msg["from"]["id"]
-    send(cid,
-         f"🆔 Your private chat ID: <code>{uid}</code>\n\n"
-         f"Set it to receive auction updates privately:\n"
-         f"<code>set GROUP_CHAT_ID={uid}</code>")
-
-def cmd_testchat(msg: dict):
-    """Debug: show what chat IDs the bot knows about and test sending."""
-    cid = msg["chat"]["id"]
-    uid = msg["from"]["id"]
-    if uid not in ADMIN_IDS:
-        send(cid, "⛔ Admin only.")
-        return
-    lines = [
-        f"<b>🔍 Chat Diagnostic</b>",
-        f"This chat ID: <code>{cid}</code>",
-        f"Your user ID: <code>{uid}</code>",
-        f"GROUP_CHAT_ID set: <code>{GROUP_CHAT_ID or 'NOT SET'}</code>",
-        f"ADMIN_IDS: <code>{list(ADMIN_IDS)}</code>",
-        "",
-        "Sending test message to this chat...",
-    ]
-    result = send(cid, "\n".join(lines))
-    if result and result.get("ok"):
-        send(cid, "✅ Bot can send to THIS chat successfully.")
-    else:
-        send(cid, f"❌ Failed: {result}")
-
-    if GROUP_CHAT_ID and GROUP_CHAT_ID != cid:
-        r2 = send(GROUP_CHAT_ID, f"✅ Test from bot — GROUP_CHAT_ID={GROUP_CHAT_ID} works!")
-        if r2 and r2.get("ok"):
-            send(cid, "✅ Also sent to GROUP_CHAT_ID successfully.")
-        else:
-            send(cid, f"❌ GROUP_CHAT_ID send failed: {r2}")
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 def dispatch(update: dict):
@@ -901,9 +802,9 @@ def dispatch(update: dict):
     if "text" not in msg:
         return
 
-    text  = msg["text"].strip()
+    text = msg["text"].strip()
 
-    # Handle force-reply responses to the custom bid prompt
+    # Handle force-reply custom bid
     reply_to = msg.get("reply_to_message", {})
     if reply_to.get("from", {}).get("is_bot"):
         raw = text.strip()
@@ -913,10 +814,9 @@ def dispatch(update: dict):
             try:
                 amount = float(raw.replace("$", "").replace(",", ""))
                 if amount > 0:
-                    user  = msg["from"]
-                    uname = get_user_display(user)
                     delete_message(msg["chat"]["id"], msg["message_id"])
-                    _place_bid(msg["chat"]["id"], user["id"], uname, amount)
+                    _place_bid(msg["chat"]["id"], msg["from"]["id"],
+                               get_user_display(msg["from"]), amount)
                     return
             except ValueError:
                 pass
