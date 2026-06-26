@@ -48,15 +48,36 @@ ANTISNIPE_EXTEND = 30   # seconds added to timer when triggered
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-def load_data() -> dict:
+# Single shared dict — all threads read/write the same object in memory.
+# Disk is a backup only (loaded once on startup).
+_store: dict = {"auctions": {}, "active_auction": None, "next_id": 1}
+
+def _init_store():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return {"auctions": {}, "active_auction": None, "next_id": 1}
+        try:
+            with open(DATA_FILE) as f:
+                data = json.load(f)
+            _store.clear()
+            _store.update(data)
+        except Exception as e:
+            log.warning(f"Could not load from disk: {e}")
+
+def load_data() -> dict:
+    return _store
 
 def save_data(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    # Mutate in place so all thread references stay valid
+    _store.clear()
+    _store.update(data)
+    # Flush to disk in background
+    snapshot = json.dumps(data, indent=2)
+    def _flush():
+        try:
+            with open(DATA_FILE, "w") as f:
+                f.write(snapshot)
+        except Exception as e:
+            log.warning(f"Disk flush failed: {e}")
+    threading.Thread(target=_flush, daemon=True).start()
 
 data_lock = threading.Lock()
 
@@ -779,7 +800,7 @@ def handle_callback(cb: dict):
             d = load_data()
         aid = d.get("active_auction")
         if not aid:
-            answer_callback(query_id, "No active auction!", alert=True)
+            answer_callback(query_id, "⛔ Auction has ended!", alert=True)
             return
         auction = d["auctions"].get(str(aid))
         time_left = max(0, int(auction["ends_at"] - time.time()))
@@ -823,11 +844,11 @@ def handle_callback(cb: dict):
             d = load_data()
             aid = d.get("active_auction")
             if not aid:
-                answer_callback(query_id, "No active auction!", alert=True)
+                answer_callback(query_id)   # silently dismiss stale button
                 return
             auction = d["auctions"].get(str(aid))
             if not auction or auction["status"] != "active" or time.time() > auction["ends_at"]:
-                answer_callback(query_id, "Auction ended!", alert=True)
+                answer_callback(query_id)   # silently dismiss stale button
                 return
 
             base   = auction["bids"][-1]["amount"] if auction["bids"] else auction["start_price"]
@@ -972,6 +993,7 @@ def run():
         log.error("❌ Set BOT_TOKEN before running!")
         return
 
+    _init_store()
     offset = 0
     log.info("✅ Polling for updates…")
 
